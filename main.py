@@ -8,6 +8,9 @@ from datetime import datetime
 import os
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from fastapi.responses import StreamingResponse
+import json
+import asyncio
 
 # Load environment variables from .env file
 load_dotenv()
@@ -292,6 +295,103 @@ async def clear_session_history(session_id: str):
     session_metadata[session_id]["last_updated"] = datetime.now()
     
     return {"message": f"Cleared {message_count} messages from session {session_id}"}
+
+async def stream_llm_api(
+    messages: List[Dict],
+    client: httpx.AsyncClient,
+    max_tokens: int = 1000,
+    temperature: float = 0.7
+):
+    """
+    Yields SSE lines: 
+      - event: token  (data: {"token": "..."} )
+      - event: meta   (data: {"session_id": "...", "message_count": N} )
+      - data: [DONE]
+    """
+    headers = {
+        "Authorization": f"Bearer {llm_config.api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:8000",
+        "X-Title": "FastAPI LLM Chatbot"
+    }
+    payload = {
+        "model": llm_config.model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True
+    }
+
+    async with client.stream(
+        "POST",
+        f"{llm_config.base_url}/chat/completions",
+        json=payload,
+        headers=headers,
+    ) as resp:
+        if resp.status_code != 200:
+            # Bubble up a single SSE error event
+            detail = await resp.aread()
+            yield f"event: error\ndata: {json.dumps({'detail': detail.decode(errors='ignore')})}\n\n"
+            return
+
+        # Relay OpenAI/OpenRouter SSE
+        async for raw_chunk in resp.aiter_lines():
+            if not raw_chunk:
+                continue
+            if raw_chunk.startswith("data: "):
+                data = raw_chunk[6:]
+                if data.strip() == "[DONE]":
+                    yield "data: [DONE]\n\n"
+                    break
+                try:
+                    obj = json.loads(data)
+                    delta = obj.get("choices", [{}])[0].get("delta", {})
+                    token = delta.get("content", "")
+                    if token:
+                        yield f"event: token\ndata: {json.dumps({'token': token})}\n\n"
+                except Exception:
+                    # If a provider sends non-JSON misc lines, ignore safely
+                    continue
+
+# NEW streaming endpoint
+@app.post("/chat/stream")
+async def chat_stream(
+    request: ChatRequest,
+    client: httpx.AsyncClient = Depends(get_http_client)
+):
+    # Ensure a session id (reuse your existing creation logic)
+    session_id = get_or_create_session(request.session_id)
+
+    # prefer DB-provided history; otherwise fallback to in-memory
+    conversation_history = request.messages or chat_sessions.get(session_id, [])
+    llm_messages = build_conversation_context(request.message, conversation_history)
+
+    async def generator():
+        # If you also want to persist user msg immediately in memory fallback:
+        if not request.messages:
+            add_message_to_session(session_id, Message(role="user", content=request.message))
+
+        async for sse_line in stream_llm_api(
+            messages=llm_messages,
+            client=client,
+            max_tokens=request.max_tokens,
+            temperature=request.temperature
+        ):
+            yield sse_line
+
+        # optionally send simple session metadata at end
+        total_messages = len(conversation_history) + 2  # user + assistant
+        yield f"event: meta\ndata: {json.dumps({'session_id': session_id, 'message_count': total_messages})}\n\n"
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Nginx: do not buffer
+        }
+    )
 
 if __name__ == "__main__":
     import uvicorn
