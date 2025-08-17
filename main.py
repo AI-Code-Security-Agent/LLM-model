@@ -21,6 +21,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(..., description="User message")
     session_id: Optional[str] = Field(None, description="Chat session ID")
+    messages: Optional[List[Message]] = Field(None, description="Previous conversation history")
     max_tokens: Optional[int] = Field(1000, description="Maximum tokens for response")
     temperature: Optional[float] = Field(0.7, description="Response temperature")
 
@@ -35,7 +36,7 @@ class SessionInfo(BaseModel):
     created_at: datetime
     last_updated: datetime
 
-# In-memory storage for chat history
+# In-memory storage for chat history (fallback)
 chat_sessions: Dict[str, List[Message]] = {}
 session_metadata: Dict[str, Dict] = {}
 
@@ -43,7 +44,7 @@ session_metadata: Dict[str, Dict] = {}
 class LLMConfig:
     def __init__(self):
         self.base_url = "https://openrouter.ai/api/v1"
-        self.model = "deepseek/deepseek-chat"
+        self.model = "deepseek/deepseek-r1-0528:free"
         self.api_key = os.getenv("OPENROUTER_API_KEY")
         
         if not self.api_key:
@@ -112,6 +113,16 @@ def add_message_to_session(session_id: str, message: Message):
 def format_messages_for_llm(messages: List[Message]) -> List[Dict]:
     """Format messages for LLM API"""
     return [{"role": msg.role, "content": msg.content} for msg in messages]
+
+def build_conversation_context(current_message: str, conversation_history: List[Message]) -> List[Dict]:
+    """Build complete conversation context for LLM"""
+    # Convert conversation history to LLM format
+    llm_messages = format_messages_for_llm(conversation_history)
+    
+    # Add current user message
+    llm_messages.append({"role": "user", "content": current_message})
+    
+    return llm_messages
 
 async def call_llm_api(
     messages: List[Dict], 
@@ -182,23 +193,26 @@ async def chat(
     request: ChatRequest,
     client: httpx.AsyncClient = Depends(get_http_client)
 ):
-    """Main chat endpoint"""
+    """Main chat endpoint with conversation history support"""
     
     try:
         # Get or create session
         session_id = get_or_create_session(request.session_id)
         
-        # Add user message to history
-        user_message = Message(role="user", content=request.message)
-        add_message_to_session(session_id, user_message)
+        # Use provided conversation history or get from memory
+        if request.messages:
+            # Use conversation history from request (preferred - from database)
+            conversation_history = request.messages
+        else:
+            # Fallback to in-memory storage
+            conversation_history = chat_sessions.get(session_id, [])
         
-        # Get full conversation history
-        session_messages = chat_sessions[session_id]
+        # Build complete conversation context
+        llm_messages = build_conversation_context(request.message, conversation_history)
         
-        # Format messages for LLM API
-        llm_messages = format_messages_for_llm(session_messages)
+        print(f"Sending {len(llm_messages)} messages to LLM for session {session_id}")
         
-        # Call LLM API
+        # Call LLM API with full conversation context
         llm_response = await call_llm_api(
             messages=llm_messages,
             client=client,
@@ -206,17 +220,24 @@ async def chat(
             temperature=request.temperature
         )
         
-        # Add assistant response to history
-        assistant_message = Message(role="assistant", content=llm_response)
-        add_message_to_session(session_id, assistant_message)
+        # Store messages in memory as fallback (if not using database)
+        if not request.messages:
+            user_message = Message(role="user", content=request.message)
+            assistant_message = Message(role="assistant", content=llm_response)
+            add_message_to_session(session_id, user_message)
+            add_message_to_session(session_id, assistant_message)
+        
+        # Calculate message count (conversation history + current user message + assistant response)
+        total_messages = len(conversation_history) + 2
         
         return ChatResponse(
             response=llm_response,
             session_id=session_id,
-            message_count=len(chat_sessions[session_id])
+            message_count=total_messages
         )
     
     except Exception as e:
+        print(f"Chat error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/sessions", response_model=List[SessionInfo])
